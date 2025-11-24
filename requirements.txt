@@ -1,0 +1,4 @@
+einops
+ninja
+numpy
+matplotlib

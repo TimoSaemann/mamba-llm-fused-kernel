@@ -1,0 +1,19 @@
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ignore PyTorch compile debug folder
+/torch_compile_debug/
+
+# Ignore IDE folder
+.idea/
+
+# Ignore traces folder
+/traces/
+
+# Ignore torchinductor cache folder
+/torchinductor_cache/
+
+# Ignore log folder
+/log/
