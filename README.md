@@ -34,12 +34,6 @@ The Mamba SSM forward pass is a perfect illustration: by changing *how* the comp
 
 Among the three kernels, only **fused_ssm_scan_reduce_kernel** provides a substantial speedup; the others are standard fusions and have minimal impact.
 
-### 🛠 What Was Modified From METR’s Version?
-
-This project builds on the excellent fused Mamba kernels from  
-https://github.com/METR/KernelBenchFiltered.  
-The core logic is unchanged — credit goes fully to METR.  
-Only light engineering adjustments were made so the kernels integrate cleanly in this repo.
 
 ## ⚡ Why the Fused Kernel Is So Much Faster
 
