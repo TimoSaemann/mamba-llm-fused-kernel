@@ -70,7 +70,8 @@ Because the improvement comes from restructuring the computation itself, it’s 
 
 ## 📊 Results: Runtime & Kernel Launch Comparison
 
-Across batch sizes, the LLM-optimized code consistently outperforms both PyTorch eager and torch.compile, with the exception of batch size 4.
+Across batch sizes, the LLM-optimized code consistently outperforms both PyTorch eager and torch.compile, with the exception of batch size 4. GPU: NVIDIA RTX 5090
+
 ![speedup_plot_torch_compile.png](plots/speedup_plot_torch_compile.png)
 
 
