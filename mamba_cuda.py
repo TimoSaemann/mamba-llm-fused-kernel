@@ -22,6 +22,7 @@ cuda_source = r'''
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <math.h>
+#include <cuda_fp16.h>
 
 extern "C" {
 
@@ -129,6 +130,74 @@ __global__ void fused_ssm_scan_reduce_kernel(const float* __restrict__ A,
     }
 }
 
+
+// ----------------------------------------------------------------
+// Fused SSM Scan-Reduce Kernel (FP16)
+// All input pointers marked const and __restrict__ for alias analysis.
+// Precompute base offsets to reduce integer arithmetic in the inner loop.
+__global__ void fused_ssm_scan_reduce_kernel_fp16(
+    const __half* __restrict__ A,
+    const __half* __restrict__ X,
+    const __half* __restrict__ C,
+    const __half* __restrict__ seq,
+    const __half* __restrict__ D,
+    __half* __restrict__ out,
+    __half* __restrict__ hid,
+    int B, int L, int d_model, int d_state
+) {
+    // Each block corresponds to one chain: a unique (b, d) pair.
+    int chain = blockIdx.x;
+    const int b_idx = chain / d_model;
+    const int d_idx = chain % d_model;
+    const int tid = threadIdx.x;  // each thread handles one element of the hidden state.
+
+    __half h_val = __float2half(0.0f);  // initial hidden state.
+    const __half D_val = D[d_idx];
+
+    // Precompute repeated stride terms and base offsets
+    const int stride_per_timestep_A = d_model * d_state;   // number of elements per timestep for A/X
+    const int stride_per_timestep_C = d_state;            // number of elements per timestep for C
+    const int stride_per_timestep_seq = d_model;          // number of elements per timestep for seq
+
+    const int baseA = b_idx * (L * stride_per_timestep_A) + d_idx * d_state; // base for A/X for this chain
+    const int baseC = b_idx * (L * stride_per_timestep_C);                   // base for C for this batch
+    const int baseSeq = b_idx * (L * stride_per_timestep_seq) + d_idx;      // base for seq per (b,d)
+
+    // Loop sequentially over time steps.
+    for (int l = 0; l < L; ++l) {
+        const int idx = baseA + l * stride_per_timestep_A + tid;   // A/X index for (b,l,d,s)
+        const __half a_val = A[idx];
+        const __half x_val = X[idx];
+
+        // recurrence
+        h_val = __hfma(a_val, h_val, x_val); // h_val = a_val * h_val + x_val
+        hid[idx] = h_val;
+
+        // C index and reduction
+        const int cidx = baseC + l * stride_per_timestep_C + tid;
+        const half c_val = C[cidx];
+        
+        // accumulate in FP32
+        float prod = __half2float(h_val) * __half2float(c_val);
+        
+        // Warp-level reduction (assumes d_state <= warpSize)
+        for (int offset = d_state / 2; offset > 0; offset /= 2) {
+            prod += __shfl_down_sync(0xffffffff, prod, offset);
+        }
+        
+        if (tid == 0) {
+            const int seqidx = baseSeq + l * stride_per_timestep_seq;
+            const half seq_val = seq[seqidx];
+        
+            float out_val =
+                prod + __half2float(D_val) * __half2float(seq_val);
+        
+            out[seqidx] = __float2half(out_val);
+        }
+    }
+}
+
+
 // ----------------------------------------------------------------
 // Fused Residual Addition Kernel:
 // Takes two tensors "a" and "b" (of the same size) and writes out elementwise a+b.
@@ -157,21 +226,44 @@ torch::Tensor fused_rmsnorm_cuda(torch::Tensor x, torch::Tensor weight, int d, f
     return out;
 }
 
-// ----------------------------------------------------------------
-// Wrapper for Fused SSM Scan-Reduce Kernel.
-torch::Tensor fused_ssm_scan_reduce_cuda(torch::Tensor A, torch::Tensor X, torch::Tensor C,
-                                         torch::Tensor seq, torch::Tensor D,
-                                         int B, int L, int d_model, int d_state,
-                                         torch::Tensor hid) {
+
+torch::Tensor fused_ssm_scan_reduce_cuda(
+    torch::Tensor A, torch::Tensor X, torch::Tensor C,
+    torch::Tensor seq, torch::Tensor D,
+    int B, int L, int d_model, int d_state,
+    torch::Tensor hid
+) {
+    auto dtype = A.scalar_type();
     auto out = torch::empty({B, L, d_model}, seq.options());
+
     dim3 grid(B * d_model);
     dim3 block(d_state);
-    fused_ssm_scan_reduce_kernel<<<grid, block>>>(A.data_ptr<float>(), X.data_ptr<float>(),
-                                                  C.data_ptr<float>(), seq.data_ptr<float>(),
-                                                  D.data_ptr<float>(), out.data_ptr<float>(),
-                                                  hid.data_ptr<float>(), B, L, d_model, d_state);
+
+    if (dtype == c10::kFloat) {
+        fused_ssm_scan_reduce_kernel<<<grid, block>>>(
+            A.data_ptr<float>(), X.data_ptr<float>(),
+            C.data_ptr<float>(), seq.data_ptr<float>(),
+            D.data_ptr<float>(), out.data_ptr<float>(),
+            hid.data_ptr<float>(), B, L, d_model, d_state
+        );
+    } else if (dtype == c10::kHalf) {
+        fused_ssm_scan_reduce_kernel_fp16<<<grid, block>>>(
+            reinterpret_cast<__half*>(A.data_ptr<c10::Half>()),
+            reinterpret_cast<__half*>(X.data_ptr<c10::Half>()),
+            reinterpret_cast<__half*>(C.data_ptr<c10::Half>()),
+            reinterpret_cast<__half*>(seq.data_ptr<c10::Half>()),
+            reinterpret_cast<__half*>(D.data_ptr<c10::Half>()),
+            reinterpret_cast<__half*>(out.data_ptr<c10::Half>()),
+            reinterpret_cast<__half*>(hid.data_ptr<c10::Half>()),
+            B, L, d_model, d_state
+        );
+    } else {
+        TORCH_CHECK(false, "Unsupported dtype for fused_ssm_scan_reduce_cuda");
+    }
+
     return out;
 }
+
 
 // ----------------------------------------------------------------
 // Wrapper for Fused Residual Addition Kernel.
@@ -193,7 +285,7 @@ torch::Tensor fused_rmsnorm_cuda(torch::Tensor x, torch::Tensor weight, int d, f
 torch::Tensor fused_ssm_scan_reduce_cuda(torch::Tensor A, torch::Tensor X, torch::Tensor C,
                                          torch::Tensor seq, torch::Tensor D,
                                          int B, int L, int d_model, int d_state,
-                                         torch::Tensor hid);
+                                         torch::Tensor hid, c10::ScalarType dtype);
 torch::Tensor fused_residual_add_cuda(torch::Tensor a, torch::Tensor b);
 }
 '''
@@ -212,7 +304,7 @@ cuda_module = load_inline(name="cuda_kernels_optimized",
 # Python Modules: RMSNorm, MambaBlock, and Model
 ################################################################################
 
-# Fused RMSNorm module using our optimized CUDA kernel.
+# Fused RMSNorm module using our optimized CUDA kernel (keep in FP32 for numerical stability).
 class RMSNorm(nn.Module):
     def __init__(self, d: int) -> None:
         super().__init__()
@@ -221,33 +313,34 @@ class RMSNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         # x has shape (..., d); flatten to 2D for row-wise processing.
+        orig_dtype = x.dtype
+        x = x.float()
         orig_shape = x.shape
         x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
-        torch.cuda.synchronize()
         out = cuda_module.fused_rmsnorm_cuda(x_2d, self.g, orig_shape[-1], self.scale, 1e-5)
-        torch.cuda.synchronize()
-        return out.reshape(orig_shape)
+        return out.reshape(orig_shape).to(orig_dtype)
 
 
 # MambaBlock that fuses the state-space model (SSM) operations via our CUDA kernel.
 class MambaBlock(nn.Module):
     def __init__(self, d_input: int, d_model: int, d_state: int = 16, d_discr: int = None,
-                 ker_size: int = 4, parallel: bool = False) -> None:
+                 ker_size: int = 4, parallel: bool = False, dtype=torch.float32) -> None:
         super().__init__()
+        self.dtype = dtype
         d_discr = d_discr or d_model // 16
-        self.in_proj = nn.Linear(d_input, 2 * d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_input, bias=False)
-        self.s_B = nn.Linear(d_model, d_state, bias=False)
-        self.s_C = nn.Linear(d_model, d_state, bias=False)
+        self.in_proj = nn.Linear(d_input, 2 * d_model, bias=False).to(dtype)
+        self.out_proj = nn.Linear(d_model, d_input, bias=False).to(dtype)
+        self.s_B = nn.Linear(d_model, d_state, bias=False).to(dtype)
+        self.s_C = nn.Linear(d_model, d_state, bias=False).to(dtype)
         self.s_D = nn.Sequential(
             nn.Linear(d_model, d_discr, bias=False),
             nn.Linear(d_discr, d_model, bias=False)
-        )
+        ).to(dtype)
         # Depthwise conv1d with padding to preserve sequence length.
-        self.conv = nn.Conv1d(d_model, d_model, ker_size, padding=ker_size - 1, groups=d_model, bias=True)
+        self.conv = nn.Conv1d(d_model, d_model, ker_size, padding=ker_size - 1, groups=d_model, bias=True).to(dtype)
         # Parameter A: (d_model, d_state) initialized as [1, 2, ..., d_state] repeated for each d_model.
-        self.A = nn.Parameter(torch.arange(1, d_state + 1, dtype=torch.float).repeat(d_model, 1))
-        self.D = nn.Parameter(torch.ones(d_model))
+        self.A = nn.Parameter(torch.arange(1, d_state + 1, dtype=dtype).repeat(d_model, 1))
+        self.D = nn.Parameter(torch.ones(d_model, dtype=dtype))
         self.parallel = parallel
 
     def forward(self, seq: Tensor, cache: tuple = None) -> tuple:
@@ -310,7 +403,7 @@ class MambaBlock(nn.Module):
             hid_tensor = torch.empty((b, l, d, s), device=A.device, dtype=A.dtype)
             fused_out = cuda_module.fused_ssm_scan_reduce_cuda(
                 A.contiguous(), X.contiguous(), C.contiguous(), seq.contiguous(),
-                self.D, b, l, d, s, hid_tensor
+                self.D, b, l, d, s, hid_tensor, self.dtype
             )
             return hid_tensor, fused_out
 
@@ -319,20 +412,23 @@ class MambaBlock(nn.Module):
         return next(self.parameters()).device
 
 
-# The complete Model with the same interface as the original.
+# The complete Model with the same interface.
 class Model(nn.Module):
     def __init__(self, vocab_size: int = 16384, num_layers: int = 8, d_input: int = 1024, d_model: int = 1024,
-                 d_state: int = 16, d_discr: int = None, ker_size: int = 4, parallel: bool = False) -> None:
+                 d_state: int = 16, d_discr: int = None, ker_size: int = 4, parallel: bool = False, dtype=torch.float32):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, d_input)
+        self.dtype = dtype
+
+        self.embedding = nn.Embedding(vocab_size, d_input).to(dtype)
         self.layers = nn.ModuleList([
             nn.ModuleList([
-                MambaBlock(d_input, d_model, d_state, d_discr, ker_size, parallel),
+                MambaBlock(d_input, d_model, d_state, d_discr, ker_size, parallel, dtype),
                 RMSNorm(d_input)
             ])
             for _ in range(num_layers)
         ])
-        self.head = nn.Linear(d_input, vocab_size, bias=False)
+        self.head = nn.Linear(d_input, vocab_size, bias=False).to(dtype)
+
 
     def forward(self, tok: Tensor, cache: tuple = None) -> Tensor:
         tok = torch.atleast_2d(tok)
@@ -340,7 +436,7 @@ class Model(nn.Module):
         for mamba, norm in self.layers:
             out, cache = mamba(norm(seq), cache)
             # Fused residual addition: seq = out + seq.
-            seq = cuda_module.fused_residual_add_cuda(out, seq)
+            seq = cuda_module.fused_residual_add_cuda(out.float(), seq.float()).to(self.dtype)  # keep FP32 for now
         return self.head(seq)
 
     @property
@@ -353,12 +449,16 @@ def get_inputs():
 
 
 if __name__ == "__main__":
+    use_fp16 = False #True
     torch.set_default_device("cuda")
-    model = Model()
+    if use_fp16:
+        model = Model(dtype=torch.float16).cuda().eval()
+    else:
+        model = Model().cuda().eval()
 
     # Make sure inputs are fixed and deterministic
     B, L = 2, 256
-    x = torch.randint(0, 16384, (B, L), device="cuda")
+    x = torch.randint(0, 16384, (B, L), device="cuda", dtype=torch.long)
 
     torch.cuda.synchronize()  # Ensure all kernels have finished
 
