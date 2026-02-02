@@ -124,7 +124,7 @@ class Model(nn.Module):
             num_layers: int = 8,
             d_input: int = 1024,
             d_model: int = 1024,
-            d_state: int = 16,
+            d_state: int = 32,
             d_discr: int = None,
             ker_size: int = 4,
             parallel: bool = False,

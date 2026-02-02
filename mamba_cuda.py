@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 import torch.nn as nn
 from torch import Tensor
@@ -401,10 +403,52 @@ class MambaBlock(nn.Module):
         else:
             # Otherwise, use our fused CUDA kernel for the recurrence scan-reduce.
             hid_tensor = torch.empty((b, l, d, s), device=A.device, dtype=A.dtype)
-            fused_out = cuda_module.fused_ssm_scan_reduce_cuda(
-                A.contiguous(), X.contiguous(), C.contiguous(), seq.contiguous(),
-                self.D, b, l, d, s, hid_tensor, self.dtype
-            )
+            # Explicit measurement mode for the fused ssm kernel: "none" | "time" | "memory"
+            MEASURE_MODE = "none"
+
+            if MEASURE_MODE == "time":
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+
+                torch.cuda.synchronize()
+                start.record()
+
+                fused_out = cuda_module.fused_ssm_scan_reduce_cuda(
+                    A.contiguous(), X.contiguous(), C.contiguous(), seq.contiguous(),
+                    self.D, b, l, d, s, hid_tensor, self.dtype
+                )
+
+                end.record()
+                torch.cuda.synchronize()
+                print("SSM kernel time (ms):", start.elapsed_time(end))
+
+
+            elif MEASURE_MODE == "memory":
+                torch.cuda.reset_peak_memory_stats()
+                torch.cuda.synchronize()
+                fused_out = cuda_module.fused_ssm_scan_reduce_cuda(
+                    A.contiguous(), X.contiguous(), C.contiguous(), seq.contiguous(),
+                    self.D, b, l, d, s, hid_tensor, self.dtype
+                )
+
+                torch.cuda.synchronize()
+                peak_bytes = torch.cuda.max_memory_allocated()
+                peak_mb = peak_bytes / (1024 ** 2)
+                peak_gb = peak_bytes / (1024 ** 3)
+
+                print(
+                    f"SSM kernel peak memory: "
+                    f"{peak_mb:,.2f} MB ({peak_gb:.2f} GB)"
+                )
+
+            else:  # MEASURE_MODE == "none"
+                torch.cuda.nvtx.range_push("SSM_FUSED_KERNEL")
+                fused_out = cuda_module.fused_ssm_scan_reduce_cuda(
+                    A.contiguous(), X.contiguous(), C.contiguous(), seq.contiguous(),
+                    self.D, b, l, d, s, hid_tensor, self.dtype
+                )
+                torch.cuda.nvtx.range_pop()
+
             return hid_tensor, fused_out
 
     @property
@@ -415,7 +459,7 @@ class MambaBlock(nn.Module):
 # The complete Model with the same interface.
 class Model(nn.Module):
     def __init__(self, vocab_size: int = 16384, num_layers: int = 8, d_input: int = 1024, d_model: int = 1024,
-                 d_state: int = 16, d_discr: int = None, ker_size: int = 4, parallel: bool = False, dtype=torch.float32):
+                 d_state: int = 32, d_discr: int = None, ker_size: int = 4, parallel: bool = False, dtype=torch.float32):
         super().__init__()
         self.dtype = dtype
 
@@ -448,33 +492,87 @@ def get_inputs():
     return [torch.randint(0, 16384, (2, 256))]
 
 
-if __name__ == "__main__":
-    use_fp16 = False #True
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default="none",
+        choices=["none", "torch", "torch_tb"],
+        help="Profiling mode: none | torch | torch_tb"
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Use FP16 (default: FP32)"
+    )
+    args = parser.parse_args()
+
+    # -------------------------
+    # Deterministic setup
+    # -------------------------
     torch.set_default_device("cuda")
-    if use_fp16:
-        model = Model(dtype=torch.float16).cuda().eval()
-    else:
-        model = Model().cuda().eval()
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
 
-    # Make sure inputs are fixed and deterministic
-    B, L = 2, 256
-    x = torch.randint(0, 16384, (B, L), device="cuda", dtype=torch.long)
+    dtype = torch.float16 if args.fp16 else torch.float32
+    model = Model(dtype=dtype).cuda().eval()
 
-    torch.cuda.synchronize()  # Ensure all kernels have finished
+    # Fixed inputs
+    B, L = 16, 512
+    x = torch.randint(
+        0, 16384,
+        (B, L),
+        device="cuda",
+        dtype=torch.long
+    )
 
-    from torch.profiler import profile, ProfilerActivity
-
-    with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as p:
+    # -------------------------
+    # Warmup (always)
+    # -------------------------
+    for _ in range(3):
         model(x)
-    p.export_chrome_trace("trace_cuda.json")
 
-    with torch.profiler.profile(
+    torch.cuda.synchronize()
+
+    # -------------------------
+    # Run modes
+    # -------------------------
+    if args.profile == "none":
+        # For Nsight Compute (ncu)
+        model(x)
+        torch.cuda.synchronize()
+
+    elif args.profile == "torch":
+        # Chrome trace
+        from torch.profiler import profile, ProfilerActivity
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]
+        ) as prof:
+            model(x)
+
+        prof.export_chrome_trace("trace_cuda.json")
+        print("Saved Chrome trace to trace_cuda.json")
+
+    elif args.profile == "torch_tb":
+        # TensorBoard-style detailed profiling
+        from torch.profiler import profile, ProfilerActivity
+
+        with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             record_shapes=True,
             profile_memory=True,
             with_stack=True,
             on_trace_ready=torch.profiler.tensorboard_trace_handler("./log")
-    ) as prof:
-        model(*get_inputs())
+        ) as prof:
+            model(x)
 
-    print(prof.key_averages().table(sort_by="cuda_time", row_limit=20))
+        print(
+            prof.key_averages()
+            .table(sort_by="cuda_time_total", row_limit=20)
+        )
+
+
+if __name__ == "__main__":
+    main()
