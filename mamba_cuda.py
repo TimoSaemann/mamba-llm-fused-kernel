@@ -119,15 +119,37 @@ __global__ void fused_ssm_scan_reduce_kernel(const float* __restrict__ A,
         const float c_val = C[cidx];
         float prod = h_val * c_val;
 
-        // Warp-level reduction for the dot product (assumes d_state <= warpSize)
-        for (int offset = d_state / 2; offset > 0; offset /= 2) {
+        // Warp-level reduction for the dot product
+        for (int offset = min(16, d_state / 2); offset > 0; offset /= 2) {
             prod += __shfl_down_sync(0xffffffff, prod, offset);
         }
 
+        if (d_state > 32) {
+            // Cross-warp reduction: accumulate one partial sum per warp
+            __shared__ float sdata[32];
+            int lane = tid % 32;        // lane within the warp
+            int warp_id = tid / 32;     // warp index within the block
+        
+            // Write one partial sum per warp
+            if (lane == 0) sdata[warp_id] = prod;
+            __syncthreads();
+        
+            // Final reduction across warps (single thread)
+            if (tid == 0) {
+                float final_prod = 0;
+                for (int i = 0; i < (d_state + 31) / 32; i++) {
+                    final_prod += sdata[i];
+                }
+                prod = final_prod;
+            }
+        }
+        
+        // final reduction
         if (tid == 0) {
-            const int seqidx = baseSeq + l * stride_per_timestep_seq; // seq index for (b,l,d)
+            const int seqidx = baseSeq + l * stride_per_timestep_seq;
             const float seq_val = seq[seqidx];
-            out[seqidx] = prod + D_val * seq_val;
+            float out_val = prod + D_val * seq_val;
+            out[seqidx] = out_val;
         }
     }
 }
@@ -182,18 +204,36 @@ __global__ void fused_ssm_scan_reduce_kernel_fp16(
         // accumulate in FP32
         float prod = __half2float(h_val) * __half2float(c_val);
         
-        // Warp-level reduction (assumes d_state <= warpSize)
-        for (int offset = d_state / 2; offset > 0; offset /= 2) {
+        // Warp-level reduction for the dot product
+        for (int offset = min(16, d_state / 2); offset > 0; offset /= 2) {
             prod += __shfl_down_sync(0xffffffff, prod, offset);
         }
         
+        if (d_state > 32) {
+            // Cross-warp reduction: accumulate one partial sum per warp
+            __shared__ float sdata[32];
+            int lane = tid % 32;        // lane within the warp
+            int warp_id = tid / 32;     // warp index within the block
+        
+            // Write one partial sum per warp
+            if (lane == 0) sdata[warp_id] = prod;
+            __syncthreads();
+        
+            // Final reduction across warps (single thread)
+            if (tid == 0) {
+                float final_prod = 0;
+                for (int i = 0; i < (d_state + 31) / 32; i++) {
+                    final_prod += sdata[i];
+                }
+                prod = final_prod;
+            }
+        }
+        
+        // Write output for this timestep and (b, d) chain
         if (tid == 0) {
             const int seqidx = baseSeq + l * stride_per_timestep_seq;
             const half seq_val = seq[seqidx];
-        
-            float out_val =
-                prod + __half2float(D_val) * __half2float(seq_val);
-        
+            float out_val = prod + __half2float(D_val) * __half2float(seq_val);
             out[seqidx] = __float2half(out_val);
         }
     }
