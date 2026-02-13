@@ -1,237 +1,172 @@
-# Mamba Fusion Example: LLM-Optimized SSM Forward Pass (FP32 & FP16)
+# Mamba Fusion Example: Fully Fused SSM Forward (FP32 & FP16)
 
-This repository provides a minimal, self-contained example showing how  
-LLMs can restructure computation in ways traditional compilers typically cannot.
+This repository demonstrates how an LLM-assisted workflow can restructure the Mamba SSM full-sequence forward pass into a fully fused CUDA kernel — outperforming PyTorch eager and benchmarking directly against the official Mamba implementation.
 
-The project demonstrates two orthogonal ideas:
+What’s new compared to earlier versions:
 
-1. **Computation restructuring** of Mamba’s SSM forward pass into a single fused CUDA kernel  
-2. **Numeric regime rewriting** from FP32 to FP16 on top of that fused kernel
-
-Together, these yield substantial speed and memory improvements over standard PyTorch implementations.
-
----
-
-## 🔍 Background and Motivation
-
-Traditional compilers focus on graph-local optimizations such as operator fusion,
-scheduling, or memory planning. They rarely rewrite a model into a fundamentally
-different computation.
-
-LLM-based workflows don’t have this limitation: they can reason about the math
-and restructure the computation itself.
-
-The Mamba SSM forward pass is a good example. By changing *how* the recurrence
-is executed (not *what* is computed), a large speedup becomes possible — even
-before changing numeric precision.
-
-This repository first demonstrates that restructuring, and then shows how
-pushing numeric precision from FP32 to FP16 further improves performance. FP16 numeric precision is widely used in AI 
-models, as it typically preserves model quality while reducing memory traffic and increasing arithmetic intensity.
+- **Deeper fusion**: the kernel now fuses precompute + scan + reduce (not just scan-reduce).
+- **Official-matching math**: the PyTorch baseline was adapted to match the official repo’s output.
+- **Direct comparison vs official Mamba**: benchmarks include `state-spaces/mamba`.
+- **Outdated profiling removed**: Nsight Compute + Chrome trace sections were dropped (not up-to-date).
 
 ---
 
-## Project Structure
+## 🔍 What Changed
+
+### 1) Deeper Fusion (Precompute + Scan + Reduce)
+
+Earlier, the main optimization fused the scan + reduction step:
+
+h[t] = A[t] * h[t-1] + X[t]
+
+y[t] = ⟨h[t], C[t]⟩ + D * seq[t]
+
+
+Now, the fused kernel performs significantly more work inside a single pass:
+
+- Computes `delta = softplus(dt)` inside the kernel  
+- Computes `exp(delta * A_param)` on the fly  
+- Avoids materializing `A_bar`, `B_bar`, or `X_bar` tensors  
+- Streams through the sequence once (no Python-level loop over `L`)  
+
+This eliminates large intermediate tensors of shape `(B, L, D, S)`.
+
+### 2) Official-Matching Baseline
+
+The baseline PyTorch implementation was adapted to match the official Mamba math and output:
+
+- Official repo: https://github.com/state-spaces/mamba  
+- We copy weights from the official model into the baseline and CUDA models to ensure:
+  - identical outputs
+  - fair runtime comparisons
+  - no “math drift” between implementations
+
+---
+
+## 📊 Results
+
+Benchmarked at sequence length L = 512, d_state = 32, d_model = 1024, across batch sizes 1–16.
+
+### Runtime Speedup (vs PyTorch Eager FP32)
+
+
+The updated fused kernels are faster than before due to the deeper fusion of SSM precomputation and recurrence.
+
+![Speedup Plot](plots/mamba_speedup_bench.png)
+
+### Peak Memory Usage
+
+Memory behaves very differently across implementations:
+
+- PyTorch eager memory grows strongly with batch size  
+- Fused CUDA and official Mamba show almost flat memory growth  
+
+This happens because the fused scan computes the recurrence online and avoids materializing the large `(B × L × D × S)` intermediate tensors that dominate memory in the eager baseline.
+
+![Memory Plot](plots/mamba_memory_bench.png)
+
+---
+
+## ⚡ Why the Fused Kernel Is Faster
+
+The baseline PyTorch implementation evaluates the recurrence via Python-level sequencing:
+
+```python
+torch.stack([h := A_t * h + X_t for A_t, X_t in zip(A, X)], dim=1)
+```
+
+This causes:
+
+- many small GPU kernel launches  
+- full materialization of hidden states `(B, L, D, S)`  
+- high memory traffic  
+
+The fused CUDA kernel instead:
+
+- streams through the sequence once  
+- keeps hidden state in registers  
+- fuses recurrence and reduction  
+- avoids allocating `(B, L, D, S)` tensors  
+- eliminates the Python loop over `L`  
+
+In short: the entire SSM forward becomes a single fused sweep over the sequence.
+
+---
+
+## 📁 Project Structure
 
 - `bench.py`  
-  Main benchmarking script.  
-  Compares correctness, runtime, speedup, and peak VRAM across:
+  Main benchmarking script. Compares correctness, runtime, and peak VRAM across:
   - PyTorch eager
   - `torch.compile`
   - PyTorch AMP FP16
   - LLM-Optimized CUDA FP32
   - LLM-Optimized CUDA FP16
-
+  - Official Mamba FP32
 
 - `mamba_baseline.py`  
-  Baseline PyTorch implementation of the Mamba SSM forward pass.
+  PyTorch reference implementation adapted to match official Mamba output.
+
+- `mamba_official.py`  
+  Wrapper around the official `mamba_ssm` implementation used for correctness and runtime comparison.
 
 - `mamba_cuda.py`  
-  Optimized CUDA implementation generated via an LLM-based workflow, containing:
-  1. `fused_rmsnorm_kernel`
-  2. `fused_ssm_scan_reduce_kernel` ← **main performance gain**
-  3. `fused_residual_add_kernel`
+  Optimized CUDA implementation built via `torch.utils.cpp_extension.load_inline`.  
+  Exposes the following CUDA extension entry points:
+  - `fused_rmsnorm_cuda`
+  - `fused_residual_add_cuda`
+  - `fused_ssm_scan_reduce_cuda` *(fallback path; consumes materialized A/X)*
+  - `fused_ssm_precompute_scan_reduce_fp32_cuda` *(all-fused FP32 path)*
+  - `fused_ssm_precompute_scan_reduce_fp16_cuda` *(all-fused FP16 path; includes specialized kernels, e.g. half2 for `d_state=32`)*
 
-Among these, only **`fused_ssm_scan_reduce_kernel`** provides a substantial
-speedup; the others are standard fusions with minor impact.
+  Internally, these dispatch to multiple specialized CUDA kernels depending on dtype and state size.
 
 ---
 
-## 📊 Results: Runtime & Kernel Launch Comparison
+## 🛠 Usage
 
-Across batch sizes 1–16, the LLM-Optimized CUDA FP16 version consistently outperforms eager, torch.compile, AMP, and the CUDA 
-FP32 version. 
+### Environment Setup
 
-![speedup_plot.png](plots/mamba_speedup_fp16.png)
-> Note: the speedup curves here use sequence length L=512; an earlier version used L=256, so absolute speedups are 
-> slightly different (CUDA FP32 went from ~7× down to ~5×).
-
-
-
-Lower precision also reduces memory pressure. Peak VRAM per forward pass drops significantly with CUDA FP16, enabling 
-larger batches, longer sequences, or larger state sizes without running into OOM (see page 2 below).
-![memory_plot.png](plots/mamba_memory_fp16.png)
-
-Profiling the fused SSM kernel with Nsight Compute shows why FP16 helps: lower memory throughput, higher compute 
-throughput, and shorter kernel duration. As the state size inside the SSM increases, arithmetic intensity rises and the 
-FP16 advantage becomes even stronger (see page 3 below).
-![SSM_kernel_ncu.png](plots/SSM_kernel_ncu.png)
-
-
-## Usage
-
-### Environment setup
 ```bash
-# Create a conda environment
 conda create -n mamba-fusion python=3.13 -y
 conda activate mamba-fusion
 
-# Install PyTorch with the correct CUDA version
-pip3 install torch --index-url https://download.pytorch.org/whl/cu130
-
-# Then install the rest
+pip install torch --index-url https://download.pytorch.org/whl/cu130
 pip install -r requirements.txt
+
+# Install official Mamba
+pip install mamba-ssm --no-build-isolation
 ```
 
 ### Run the benchmark:
    ```bash
    python bench.py
    ```
-
 This runs the PyTorch eager baseline, torch.compile, AMP, and the LLM-Optimized fused CUDA
 implementations (FP32 and FP16), checks correctness, and reports runtime and memory
 metrics.
 
----
-
-### 🔬 Profiling & Analysis
-
-The fused SSM kernel can be profiled independently using Nsight Compute or
-PyTorch’s built-in profilers.
-
-#### Nsight Compute (kernel-level metrics)
-
-To profile the fused scan–reduce kernel with Nsight Compute:
-
-```bash
-ncu \
-  -k regex:fused_ssm_scan_reduce \
-  --set basic \
-  --replay-mode kernel \
-  -c 1 \
-  -o ssm_fp16 \
-  python mamba_cuda.py --fp16
-```
-This generates an .ncu-rep file with kernel-level metrics such as memory
-throughput, compute throughput, and kernel duration.
-For FP32, just omit `--fp16`.
-
-#### Chrome trace (timeline-level debugging)
-
-To generate a Chrome trace for visualizing kernel launches and execution order:
-```bash
-python mamba_cuda.py --fp16 --profile torch
-```
-Open the trace in Chrome:
-
-1. Navigate to `chrome://tracing`
-2. Click **Load** and select the generated `.json` file
-
-This view is useful for understanding kernel fusion, launch counts, and
-serialization effects.
-
-
-## ⚡ Why the Fused Kernel Is Faster
-
-The baseline PyTorch implementation computes the SSM recurrence
-
-``h[t] = A[t] * h[t-1] + X[t]``
-
-followed by
-
-``y[t] = ⟨h[t], C[t]⟩ + D * seq[t]``
-
-across L sequential timesteps, with separate GPU kernels. In code, this is written as:
-
-``torch.stack([h := A_t * h + X_t for A_t, X_t in zip(A, X)], dim=1)``
-
-Here, `torch.stack` triggers synchronization and materializes all intermediate hidden states, adding to memory usage and GPU launch overhead.
-
-The fused CUDA kernel takes a completely different approach:
-
-- Fuses the recurrence **and** the dot-product reduction into one kernel  
-- Streams through the sequence once — no repeated GPU launches  
-- Keeps intermediate state in registers instead of writing `h` to memory  
-- Avoids allocating or materializing the full hidden-state tensor  
-- Removes the Python-level loop over L entirely
-
-In short:
-
-> **The entire SSM forward pass becomes a single fused sweep over the sequence — not L serial kernels with massive intermediate tensors.**
-
-This is a computation-level optimization, not a hardware trick, and is
-vendor-independent.
-
----
-
-
-### 🔍 Eager vs. LLM-Optimized CUDA (Profiler Traces)
-To understand *why* the fused kernel is faster, it’s helpful to look not only at wall-clock runtimes but also at the 
-Chrome trace produced by the PyTorch profiler.
-
-Below are Chrome trace screenshots for:
-
-- PyTorch Eager Baseline
-- LLM-Optimized Fused CUDA Kernel
-
-Both traces are zoomed into the `_hid_states` section of the computation, which corresponds to the SSM recurrence:
-
-$$h[t] = A[t] \cdot h[t-1] + X[t]$$
-
-#### 🐢 Baseline (PyTorch Eager)
-
-In the baseline trace, you can see **tons of tiny kernel launches**.  
-This happens because the eager implementation evaluates the recurrence as a sequence of small ops, resulting in:
-
-- Many small GPU kernel launches for the scan  
-- Full materialization of the hidden-state tensor `(B, L, D, S)`  
-- Poor GPU utilization due to launch overhead and small kernel sizes
-
-This kernel-launch bottleneck dominates runtime for long sequences.
-
-![hid_states_eager.png](plots/hid_states_eager.png)
-
-#### 🚀 LLM-Optimized CUDA (Fused Kernel)
-
-In the optimized trace, the picture is totally different:
-
-- Only a few kernels, with *one large kernel* performing the entire scan-reduce  
-- No intermediate hidden-state tensor is ever materialized  
-- High GPU occupancy inside a single fused pass  
-
-The recurrence and the dot-product reduction are computed **inside registers**, not via Python loops or separate ops.
-
-This structural rewrite is the source of the speedup.
-
-![hid_states_cuda.png](plots/hid_states_cuda.png)
----
-
 
 ## 🙏 Acknowledgements / Kernel Origin
 
-This project builds on the excellent fused Mamba kernels from  
+This project originally started from the fused SSM kernel in  
 [METR’s KernelBenchFiltered](https://github.com/METR/KernelBenchFiltered).
 
-The **core fused SSM kernel logic is unchanged** — full credit goes to METR.
+However, the current implementation goes significantly beyond the original version:
 
-This repository adds:
-- Integration into a standalone, reproducible benchmark
-- Cleaned-up PyTorch bindings for easier experimentation
-- An FP16 variant of the fused kernel
-- End-to-end benchmarking and profiling (runtime, memory, Nsight Compute)
-- Minor engineering adjustments (e.g., indexing cleanup, `__restrict__` annotations, hoisting loop-invariant values); 
+- The kernel was extended to fuse additional computation (precompute + scan + reduce).
+- A fully fused FP16 path was implemented (not present in the original).
+- The math was aligned with the official Mamba implementation (`state-spaces/mamba`).
+- Weight transfer logic was implemented to ensure exact output parity with the official repo.
+- The surrounding PyTorch baseline was rewritten to match official Mamba numerics.
 
+In other words, while the initial fused scan idea was inspired by METR’s kernel,
+the current codebase substantially restructures, extends, and adapts it.
+
+Credit goes to METR for the original fused scan concept —  
+the deeper fusion, FP16 path, official alignment, and benchmarking framework were developed here.
 
 ## License
 
 MIT
+

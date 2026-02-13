@@ -1,10 +1,11 @@
+import math
 from typing import Tuple
 
 import torch
 import torch.nn as nn
-from einops import einsum, rearrange
+import torch.nn.functional as F
+from einops import rearrange, einsum
 from torch import Tensor
-from torch.nn.functional import silu, softplus
 
 
 class RMSNorm(nn.Module):
@@ -19,102 +20,108 @@ class RMSNorm(nn.Module):
         return out
 
 
-def pscan(A: Tensor, X: Tensor) -> Tensor:
-    """Parallel scan for computing hidden states efficiently."""
-    return rearrange(A * X, 'l b d s -> b l d s')
-
-
 class MambaBlock(nn.Module):
-    def __init__(
-            self,
-            d_input: int,
-            d_model: int,
-            d_state: int = 16,
-            d_discr: int = None,
-            ker_size: int = 4,
-            parallel: bool = False,
-    ) -> None:
+    def __init__(self, d_model: int, d_state: int = 32, ker_size: int = 4):
         super().__init__()
+        self.d_model = d_model
+        self.d_state = d_state
+        self.dt_rank = math.ceil(d_model / 16)
 
-        d_discr = d_discr or d_model // 16
-
-        self.in_proj = nn.Linear(d_input, 2 * d_model, bias=False)
-        self.out_proj = nn.Linear(d_model, d_input, bias=False)
-
-        self.s_B = nn.Linear(d_model, d_state, bias=False)
-        self.s_C = nn.Linear(d_model, d_state, bias=False)
-        self.s_D = nn.Sequential(
-            nn.Linear(d_model, d_discr, bias=False),
-            nn.Linear(d_discr, d_model, bias=False),
-        )
+        # matches official (expand=1 => d_inner=d_model)
+        self.in_proj = nn.Linear(d_model, 2 * d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
 
         self.conv = nn.Conv1d(
             d_model, d_model, ker_size,
             padding=ker_size - 1, groups=d_model, bias=True
         )
 
-        self.A = nn.Parameter(torch.arange(1, d_state + 1, dtype=torch.float).repeat(d_model, 1))
+        # unfused equivalents of official x_proj slices
+        self.s_dt = nn.Linear(d_model, self.dt_rank, bias=False)
+        self.s_B  = nn.Linear(d_model, d_state, bias=False)
+        self.s_C  = nn.Linear(d_model, d_state, bias=False)
+
+        # official dt expand + bias
+        self.dt_proj = nn.Linear(self.dt_rank, d_model, bias=True)
+
+        # official parameterization of A
+        # store A_log like official (or store A and convert in forward)
+        A = torch.arange(1, d_state + 1, dtype=torch.float32).unsqueeze(0).repeat(d_model, 1)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        # official skip
         self.D = nn.Parameter(torch.ones(d_model))
-        self.parallel = parallel
 
-    def forward(self, seq: Tensor, cache: Tuple = None) -> Tuple[Tensor, Tuple]:
-        b, l, d = seq.shape
-        prev_hid, prev_inp = (None, None) if cache is None else cache
+    def forward(self, seq: Tensor) -> Tensor:
+        B, L, D = seq.shape
 
-        a, b = self.in_proj(seq).chunk(2, dim=-1)
+        a, z = self.in_proj(seq).chunk(2, dim=-1)
 
-        x = rearrange(a, 'b l d -> b d l')
-        x = x if prev_inp is None else torch.cat((prev_inp, x), dim=-1)
-        a = self.conv(x)[..., :l]
-        a = rearrange(a, 'b d l -> b l d')
+        # depthwise conv on a
+        x = rearrange(a, "b l d -> b d l")
+        x = self.conv(x)[..., :L]
+        x = F.silu(x)  # official uses SiLU activation
 
-        a = silu(a)
-        a, hid = self.ssm(a, prev_hid)
-        b = silu(b)
+        # compute dt, B, C from x (note: x currently BDL)
+        x_bl_d = rearrange(x, "b d l -> (b l) d")
 
-        out = a * b
-        out = self.out_proj(out)
+        dt_low = self.s_dt(x_bl_d)                  # (B*L, dt_rank)
+        dt = self.dt_proj(dt_low)                   # (B*L, D) includes bias
+        dt = rearrange(dt, "(b l) d -> b l d", b=B, l=L)
 
-        if cache is not None:
-            cache = (hid.squeeze(), x[..., 1:])
+        Bv = self.s_B(x_bl_d)                       # (B*L, d_state)
+        Cv = self.s_C(x_bl_d)                       # (B*L, d_state)
 
-        return out, cache
+        # reshape to match scan math
+        Bv = rearrange(Bv, "(b l) s -> b l s", b=B, l=L)
+        Cv = rearrange(Cv, "(b l) s -> b l s", b=B, l=L)
 
-    def ssm(self, seq: Tensor, prev_hid: Tensor = None) -> Tuple[Tensor, Tensor]:
-        A = -self.A
-        D = self.D
+        # delta is softplus(dt) (dt already has bias)
+        delta = F.softplus(dt)                      # (B, L, D)
 
-        B = self.s_B(seq)
-        C = self.s_C(seq)
-        Δ = softplus(D + self.s_D(seq))
+        A = -torch.exp(self.A_log.float())          # (D, S)
 
-        A_bar = einsum(torch.exp(A), Δ, 'd s, b l d -> b l d s')
-        B_bar = einsum(B, Δ, 'b l s, b l d -> b l d s')
-        X_bar = einsum(B_bar, seq, 'b l d s, b l d -> b l d s')
+        # x currently is (B, D, L) after conv + silu
+        x_bld = rearrange(x, "b d l -> b l d")  # (B, L, D)
 
-        hid = self._hid_states(A_bar, X_bar, self.parallel, prev_hid)
-        out = einsum(hid, C, 'b l d s, b l s -> b l d')
-        out = out + D * seq
+        # delta is (B, L, D)
+        # A is (D, S)
+        # Bv, Cv are (B, L, S)
 
-        return out, hid
+        # A_bar = exp(delta * A)  -> (B, L, D, S)
+        A_bar = torch.exp(einsum(A, delta, 'd s, b l d -> b l d s'))
 
-    def _hid_states(self, A: Tensor, X: Tensor, parallel: bool = False, prev_hid: Tensor = None) -> Tensor:
-        b, l, d, s = A.shape
-        A = rearrange(A, 'b l d s -> l b d s')
-        X = rearrange(X, 'b l d s -> l b d s')
+        # B_bar = delta * B  -> (B, L, D, S)
+        # (broadcast B over D)
+        B_bar = einsum(Bv, delta, 'b l s, b l d -> b l d s')
 
-        if prev_hid is not None:
-            return rearrange(A * prev_hid + X, 'l b d s -> b l d s')
+        # X_bar = B_bar * x -> (B, L, D, S)
+        X_bar = einsum(B_bar, x_bld, 'b l d s, b l d -> b l d s')
 
-        h = None if parallel else torch.zeros(b, d, s, device=self.device)
-        return pscan(A, X) if parallel else torch.stack([
-            h := A_t * h + X_t for A_t, X_t in zip(A, X)
-        ], dim=1)
+        # hid via old-baseline scan algorithm
+        hid = self._hid_states(A_bar, X_bar)  # (B, L, D, S)
 
+        # output: sum over state with C, then add skip
+        y = einsum(hid, Cv, 'b l d s, b l s -> b l d')  # (B, L, D)
+        y = y + self.D.unsqueeze(0).unsqueeze(0) * x_bld
+        # (B, L, D)
 
-    @property
-    def device(self) -> torch.device:
-        return next(self.parameters()).device
+        # gate by silu(z)
+        y = y * F.silu(z)
+
+        # out proj
+        out = self.out_proj(y)
+        return out
+
+    @staticmethod
+    def _hid_states(A_bar: Tensor, X_bar: Tensor) -> Tensor:
+        # A_bar, X_bar: (B, L, D, S)
+        b, l, d, s = A_bar.shape
+        A = rearrange(A_bar, 'b l d s -> l b d s')
+        X = rearrange(X_bar, 'b l d s -> l b d s')
+
+        h = torch.zeros(b, d, s, device=A_bar.device, dtype=torch.float32)
+        return torch.stack([h := A_t * h + X_t for A_t, X_t in zip(A, X)], dim=1)
 
 
 class Model(nn.Module):
@@ -122,20 +129,17 @@ class Model(nn.Module):
             self,
             vocab_size: int = 16384,
             num_layers: int = 8,
-            d_input: int = 1024,
             d_model: int = 1024,
             d_state: int = 32,
-            d_discr: int = None,
             ker_size: int = 4,
-            parallel: bool = False,
     ) -> None:
         super().__init__()
-
+        d_input = d_model
         self.embedding = nn.Embedding(vocab_size, d_input)
 
         self.layers = nn.ModuleList([
             nn.ModuleList([
-                MambaBlock(d_input, d_model, d_state, d_discr, ker_size, parallel),
+                MambaBlock(d_model=d_model, d_state=d_state, ker_size=ker_size),
                 RMSNorm(d_input)
             ])
             for _ in range(num_layers)
@@ -143,12 +147,12 @@ class Model(nn.Module):
 
         self.head = nn.Linear(d_input, vocab_size, bias=False)
 
-    def forward(self, tok: Tensor, cache: Tuple = None) -> Tuple[Tensor, Tuple]:
+    def forward(self, tok: Tensor) -> Tuple[Tensor, Tuple]:
         tok = torch.atleast_2d(tok)
         seq = self.embedding(tok)
 
         for mamba, norm in self.layers:
-            out, cache = mamba(norm(seq), cache)
+            out = mamba(norm(seq))
             seq = out + seq
 
         return self.head(seq)
